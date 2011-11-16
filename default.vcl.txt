@@ -1,0 +1,201 @@
+backend default {
+    .host = "127.0.0.1";
+    .port = "8082";
+    .connect_timeout = 600s;
+    .first_byte_timeout = 600s;
+    .between_bytes_timeout = 600s;
+}
+
+sub vcl_recv {
+  if (
+req.request != "GET" &&
+    req.request != "HEAD" &&
+    req.request != "PUT" &&
+    req.request != "POST" &&
+    req.request != "TRACE" &&
+    req.request != "OPTIONS" &&
+    req.request != "DELETE") {
+      /* Non-RFC2616 or CONNECT which is weird. */
+      return (pipe);
+  }
+  if (
+req.request != "GET" && req.request != "HEAD") {
+    /* We only deal with GET and HEAD by default */
+    return (pass);
+  }
+ 
+// Remove has_js and Google Analytics __* cookies.
+  set req.http.Cookie = regsuball(req.http.Cookie, "(^|;\s*)(__[a-z]+|has_js)=[^;]*", "");
+  // Remove a ";" prefix, if present.
+  set req.http.Cookie = regsub(req.http.Cookie, "^;\s*", "");
+  // Remove empty cookies.
+  if (req.http.Cookie ~ "^\s*$") {
+    unset req.http.Cookie;
+  }
+
+// Skip the Varnish cache for install, update, and cron
+  if (req.url ~ "install\.php|update\.php|cron\.php|admin\.php|batch\.php") {
+    return (pass);
+  }
+
+# Do not cache these paths.
+if (req.url ~ "^/status\.php$" ||
+    req.url ~ "^/update\.php$" ||
+    req.url ~ "^/ooyala/ping$" ||
+    req.url ~ "^/admin/build/features" ||
+    req.url ~ "^/info/.*$" ||
+    req.url ~ "^/batch/.*$" ||
+    req.url ~ "^/batch/.*$" ||
+    req.url ~ "^/flag/.*$" ||
+    req.url ~ "^.*/ajax/.*$" ||
+    req.url ~ "^.*/ahah/.*$") {
+     return (pass);
+}
+if (
+req.http.Authorization || req.http.Cookie) {
+    /* Not cacheable by default */
+    return (pass);
+  }
+ 
+// Normalize the Accept-Encoding header
+  // as per: http://varnish-cache.org/wiki/FAQ/Compression
+  if (req.http.Accept-Encoding) {
+    if (req.url ~ "\.(jpg|png|gif|gz|tgz|bz2|tbz|mp3|ogg)$") {
+      # No point in compressing these
+      remove req.http.Accept-Encoding;
+    }
+    elseif (req.http.Accept-Encoding ~ "gzip") {
+      set req.http.Accept-Encoding = "gzip";
+    }
+    else {
+      # Unknown or deflate algorithm
+      remove req.http.Accept-Encoding;
+    }
+  }
+ 
+# Pipe these paths directly to Apache for streaming.
+  if (req.url ~ "^/admin/content/backup_migrate/export") {
+    return (pipe);
+  }
+ 
+# Do not allow outside access to cron.php or install.php.
+  if (req.url ~ "^/(cron|install)\.php$") {
+    # Have Varnish throw the error directly.
+    error 404 "Page not found.";
+    # Use a custom error page that you've defined in Drupal at the path "404".
+    # set req.url = "/404";
+  }
+ 
+# Handle compression correctly. Different browsers send different
+  # "Accept-Encoding" headers, even though they mostly all support the same
+  # compression mechanisms. By consolidating these compression headers into
+  # a consistent format, we can reduce the size of the cache and get more hits.=
+  # @see: http:// varnish.projects.linpro.no/wiki/FAQ/Compression
+  if (req.http.Accept-Encoding) {
+    if (req.http.Accept-Encoding ~ "gzip") {
+      # If the browser supports it, we'll use gzip.
+      set req.http.Accept-Encoding = "gzip";
+    }
+    else if (req.http.Accept-Encoding ~ "deflate") {
+      # Next, try deflate if it is supported.
+      set req.http.Accept-Encoding = "deflate";
+    }
+    else {
+      # Unknown algorithm. Remove it and send unencoded.
+      unset req.http.Accept-Encoding;
+    }
+  }
+ 
+# Always cache the following file types for all users.
+  if (req.url ~ "(?i)\.(png|gif|jpeg|jpg|ico|swf|css|js|html|htm)(\?[a-z0-9]+)?$") {
+    unset req.http.Cookie;
+  }
+ 
+# Remove all cookies that Drupal doesn't need to know about. ANY remaining
+  # cookie will cause the request to pass-through to Apache. For the most part
+  # we always set the NO_CACHE cookie after any POST request, disabling the
+  # Varnish cache temporarily. The session cookie allows all authenticated users
+  # to pass through as long as they're logged in.
+  if (req.http.Cookie) {
+    set req.http.Cookie = ";" req.http.Cookie;
+    set req.http.Cookie = regsuball(req.http.Cookie, "; +", ";");
+    set req.http.Cookie = regsuball(req.http.Cookie, ";(SESS[a-z0-9]+|NO_CACHE)=", "; \1=");
+    set req.http.Cookie = regsuball(req.http.Cookie, ";[^ ][^;]*", "");
+    set req.http.Cookie = regsuball(req.http.Cookie, "^[; ]+|[; ]+$", "");
+    if (
+req.http.Cookie == "") {
+      # If there are no remaining cookies, remove the cookie header. If there
+      # aren't any cookie headers, Varnish's default behavior will be to cache
+      # the page.
+      unset req.http.Cookie;
+    }
+    else {
+      # If there is any cookies left (a session or NO_CACHE cookie), do not
+      # cache the page. Pass it on to Apache directly.
+      return (pass);
+    }
+  }
+  if (
+req.url ~ "node\?page=[0-9]+$") {
+         set req.url = regsub(req.url, "node(\?page=[0-9]+$)", "\1");
+         return (lookup);
+   }
+ 
+// Let's have a little grace
+  set req.grace = 30s;
+  return (
+lookup);
+}
+
+sub vcl_hash {
+  if (req.http.Cookie) {
+    set req.hash += req.http.Cookie;
+  }
+}
+
+# Code determining what to do when serving items from the Apache servers.
+sub vcl_fetch {
+  # Don't allow static files to set cookies.
+  if (req.url ~ "(?i)\.(png|gif|jpeg|jpg|ico|swf|css|js|html|htm)(\?[a-z0-9]+)?$") {
+    # beresp == Back-end response from the web server.
+    unset beresp.http.set-cookie;
+  }
+ 
+# Allow items to be stale if needed.
+  set beresp.grace = 6h;
+}
+
+sub vcl_error {
+   // Let's deliver a friendlier error page.
+   // You can customize this as you wish.
+   set obj.http.Content-Type = "text/html; charset=utf-8";
+   synthetic {"
+   <?xml version="1.0" encoding="utf-8"?>
+   <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+   <html>
+     <head>
+       <title>"} obj.status " " obj.response {"</title>
+       <style type="text/css">
+       #page {width: 400px; padding: 10px; margin: 20px auto; border: 1px solid black; background-color: #FFF;}
+       p {margin-left:20px;}
+       body {background-color: #DDD; margin: auto;}
+       </style>
+     </head>
+     <body>
+     <div id="page">
+     <h1>Page Could Not Be Loaded</h1>
+     <p>We're very sorry, but the page could not be loaded properly. This should be fixed very soon, and we apologize for any inconvenience.</p>
+     <hr />     <h4>Debug Info:</h4>
+     <pre>
+Status: "} obj.status {"
+Response: "} obj.response {"
+XID: "} req.xid {"
+</pre>
+       </div>
+     </body>
+    </html>
+    "};
+    return(deliver);
+}
+?>
