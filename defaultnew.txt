@@ -1,0 +1,209 @@
+backend default {
+.host = "127.0.0.1";
+.port = "8080";
+.connect_timeout = 600s;
+.first_byte_timeout = 600s;
+.between_bytes_timeout = 600s;
+.max_connections = 800;
+}
+#backend sitea {
+#.host = "xxx.xx.xxx.103";
+#.port = "8080";
+#.connect_timeout = 600s;
+#.first_byte_timeout = 600s;
+#.between_bytes_timeout = 600s;
+#.max_connections = 800;
+#}
+#backend siteb {
+#.host = "xxx.xx.xxx.104";
+#.port = "8080";
+#.connect_timeout = 600s;
+#.first_byte_timeout = 600s;
+#.between_bytes_timeout = 600s;
+#.max_connections = 800;
+#}
+
+
+sub vcl_recv {
+# Now we use the different backends based on the uri of the site. Again, this is
+# not needed if you're running a single site on a server
+#if (req.http.host ~ "sitea.com$") {
+#set req.backend = sitea;
+#} else if (req.http.host ~ "siteb.com$") {
+#set req.backend = siteb;
+#} else {
+# Use the default backend for all other requests
+#set req.backend = default;
+#}
+# Allow a grace period for offering "stale" data in case backend lags
+set req.grace = 5m;
+remove req.http.X-Forwarded-For;
+set req.http.X-Forwarded-For = client.ip;
+# Properly handle different encoding types
+if (req.http.Accept-Encoding) {
+if (req.url ~ "\.(jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf)$") {
+# No point in compressing these
+remove req.http.Accept-Encoding;
+} elsif (req.http.Accept-Encoding ~ "gzip") {
+set req.http.Accept-Encoding = "gzip";
+} elsif (req.http.Accept-Encoding ~ "deflate") {
+set req.http.Accept-Encoding = "deflate";
+} else {
+# unkown algorithm
+remove req.http.Accept-Encoding;
+}
+}
+# Force lookup if the request is a no-cache request from the client
+if (req.http.Cache-Control ~ "no-cache") {
+return (pass);
+}
+## Default request checks
+if (req.request != "GET" &&
+req.request != "HEAD" &&
+req.request != "PUT" &&
+req.request != "POST" &&
+req.request != "TRACE" &&
+req.request != "OPTIONS" &&
+req.request != "DELETE") {
+# Non-RFC2616 or CONNECT which is weird.
+return (pipe);
+}
+if (req.request != "GET" && req.request != "HEAD") {
+# We only deal with GET and HEAD by default
+return (pass);
+}
+## Modified from default to allow caching if cookies are set, but not http auth
+if (req.http.Authorization) {
+/* Not cacheable by default */
+return (pass);
+}
+## This would make varnish skip caching for this particular site
+#if (req.http.host ~ "internet-safety.yoursphere.com$") {
+#return (pass);
+#}
+# This makes varnish skip caching for every site except this one
+# Commented out here, but shown for sake of some use cases
+#if (req.http.host != "sitea.com") {
+#   return (pass);
+#}
+## Remove has_js and Google Analytics cookies.
+set req.http.Cookie = regsuball(req.http.Cookie, "(^|;\s*)(__[a-z]+|has_js)=[^;]*", "");
+## Remove a ";" prefix, if present.
+set req.http.Cookie = regsub(req.http.Cookie, "^;\s*", "");
+## Remove empty cookies.
+if (req.http.Cookie ~ "^\s*$") {
+unset req.http.Cookie;
+}
+## Pass cron jobs
+if (req.url ~ "cron.php") {
+return (pass);
+}
+# Pass server-status
+if (req.url ~ ".*/server-status$") {
+return (pass);
+}
+# Don't cache install.php
+if (req.url ~ "install.php") {
+return (pass);
+}
+  
+# Cache things with these extensions
+if (req.url ~ "\.(js|css|jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf)$") {
+    return (lookup);
+}
+# Don't cache Drupal logged-in user sessions
+# LOGGED_IN is the cookie that earlier version of Pressflow sets
+# VARNISH is the cookie which the varnish.module sets
+if (req.http.Cookie ~ "(VARNISH|DRUPAL_UID|LOGGED_IN)") {
+return (pass);
+}
+}
+sub vcl_fetch {
+  # Grace to allow varnish to serve content if backend is lagged
+  set obj.grace = 5m;
+# These status codes should always pass through and never cache.
+if (obj.status == 404 || obj.status == 503 || obj.status == 500) {
+set obj.http.X-Cacheable = "NO: obj.status";
+set obj.http.X-Cacheable-status = obj.status;
+return (pass);
+}
+    
+  if (req.url ~ "\.(js|css|jpg|jpeg|png|gif|gz|tgz|bz2|tbz|mp3|ogg|swf)$") {
+   unset beresp.http.set-cookie;
+}
+if (req.url ~ "^/files/") {
+unset req.http.Set-Cookie;
+set obj.cacheable = true;
+}
+if (req.url ~ "^/sites/") {
+unset req.http.Set-Cookie;
+set obj.cacheable = true;
+}
+if (!obj.cacheable) {
+set obj.http.X-Cacheable = "NO: !obj.cacheable";
+return (pass);
+}
+else {
+# From http://varnish-cache.org/wiki/VCLExampleLongerCaching
+/* Remove Expires from backend, it's not long enough */
+unset obj.http.expires;
+# These TTLs are based on the specific paths and may not apply to your site.
+# You could just set a single default TTL if you want.
+if (req.url ~ "(.js|.css)$") {
+set obj.ttl = 60m; // js and css files ttl 60 minutes
+}
+else if (req.url ~ "(^/articles/)|(^/tags/)|(^/taxonomy/)") {
+set obj.ttl = 10m; // list page ttl 10 minutes
+}
+else if (req.url ~ "^/article/") {
+set obj.ttl = 5m; // article ttl 5 minutes
+}
+else {
+set obj.ttl = 45m; // default ttl 45 minutes
+}
+/* marker for vcl_deliver to reset Age: */
+set obj.http.magicmarker = "1";
+# All tests passed, therefore item is cacheable
+set obj.http.X-Cacheable = "YES";
+}
+return (deliver);
+}
+sub vcl_deliver {
+  # From http://varnish-cache.org/wiki/VCLExampleLongerCaching
+  if (resp.http.magicmarker) {
+     /* Remove the magic marker */
+     unset resp.http.magicmarker;
+     /* By definition we have a fresh object */
+     set resp.http.age = "0";
+   }
+   #add cache hit data
+   if (obj.hits > 0) {
+     #if hit add hit count
+     set resp.http.X-Cache = "HIT";
+     set resp.http.X-Cache-Hits = obj.hits;
+   }
+else {
+     set resp.http.X-Cache = "MISS";
+   }
+}
+sub vcl_error {
+if (obj.status == 503 && req.restarts < 5) {
+set obj.http.X-Restarts = req.restarts;
+restart;
+}
+}
+# Added to let users force refresh
+sub vcl_hit {
+if (!obj.cacheable) {
+pass;
+}
+if (req.http.Cache-Control ~ "no-cache") {
+# Ignore requests via proxy caches,  IE users and badly behaved crawlers
+# like msnbot that send no-cache with every request.
+if (! (req.http.Via || req.http.User-Agent ~ "bot|MSIE")) {
+set obj.ttl = 0s;
+return (restart);
+} 
+}
+deliver;
+}
